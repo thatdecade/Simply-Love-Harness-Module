@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ITGmania Harness Demo</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      margin: 16px;
+    }
+    .row {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+    }
+    .col {
+      flex: 1;
+      min-width: 320px;
+    }
+    .panel-title {
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    #songsList {
+      width: 100%;
+      min-height: 420px;
+    }
+    .controls {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    button {
+      padding: 8px 14px;
+      cursor: pointer;
+    }
+    select {
+      padding: 6px;
+    }
+    .status-line {
+      margin: 8px 0 12px 0;
+      color: #333;
+    }
+    #logBox {
+      background: #111;
+      color: #eee;
+      padding: 10px;
+      min-height: 220px;
+      overflow: auto;
+      white-space: pre-wrap;
+      border-radius: 6px;
+    }
+    #statusBar {
+      margin-top: 14px;
+      padding: 10px;
+      border-top: 1px solid #ccc;
+      color: #222;
+      font-size: 14px;
+      white-space: pre-wrap;
+    }
+    .inline {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .hint {
+      color: #555;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <h1>ITGmania Harness Demo</h1>
+  <div class="status-line" id="connectionInfo">Loading...</div>
+
+  <div class="row">
+    <div class="col">
+      <div class="panel-title">Song list</div>
+      <select id="songsList" size="20" aria-label="Song list"></select>
+    </div>
+
+    <div class="col controls">
+      <div class="inline">
+        <div class="panel-title" style="margin: 0;">Difficulty</div>
+        <select id="difficultySelect" disabled aria-label="Difficulty"></select>
+      </div>
+
+      <div class="buttons">
+        <button id="startButton" disabled>Start</button>
+        <button id="pauseButton" disabled>Pause</button>
+        <button id="stopButton" disabled>Stop</button>
+        <button id="refreshButton">Refresh songs</button>
+      </div>
+
+      <div class="hint">
+        If songs do not load, go to ScreenSelectMusic in ITGmania and join P1.
+      </div>
+
+      <div class="panel-title">Logs</div>
+      <pre id="logBox"></pre>
+    </div>
+  </div>
+
+  <div id="statusBar"></div>
+
+  <script>
+    "use strict";
+
+    let cachedSongs = [];
+    let selectedSongDir = "";
+    let latestState = null;
+    let songsLoadedOnce = false;
+
+    const songsListElement = document.getElementById("songsList");
+    const difficultySelectElement = document.getElementById("difficultySelect");
+    const startButtonElement = document.getElementById("startButton");
+    const pauseButtonElement = document.getElementById("pauseButton");
+    const stopButtonElement = document.getElementById("stopButton");
+    const refreshButtonElement = document.getElementById("refreshButton");
+    const statusBarElement = document.getElementById("statusBar");
+    const connectionInfoElement = document.getElementById("connectionInfo");
+    const logBoxElement = document.getElementById("logBox");
+
+    function safeString(value) {
+      if (value === null || value === undefined) {
+        return "";
+      }
+      try {
+        return String(value);
+      } catch (error) {
+        return "";
+      }
+    }
+
+    async function fetchJson(url, options) {
+      const response = await fetch(url, options);
+      if (!response.ok) {
+        const responseText = await response.text();
+        throw new Error("HTTP " + response.status + ": " + responseText);
+      }
+      return await response.json();
+    }
+
+    function buildSongDisplayText(song) {
+      const parts = [];
+      if (song.title) {
+        parts.push(song.title);
+      }
+      if (song.artist) {
+        parts.push("by " + song.artist);
+      }
+      if (song.group) {
+        parts.push("[" + song.group + "]");
+      }
+      const joined = parts.join(" ").trim();
+      return joined || song.song_dir || "(unknown)";
+    }
+
+    function renderSongsList(songs) {
+      const previousSelection = selectedSongDir;
+
+      songsListElement.innerHTML = "";
+      for (const song of songs) {
+        const option = document.createElement("option");
+        option.value = song.song_dir;
+        option.textContent = buildSongDisplayText(song);
+        songsListElement.appendChild(option);
+      }
+
+      if (previousSelection) {
+        for (let index = 0; index < songsListElement.options.length; index += 1) {
+          const option = songsListElement.options[index];
+          if (option.value === previousSelection) {
+            songsListElement.selectedIndex = index;
+            selectedSongDir = previousSelection;
+            onSongSelectionChanged();
+            return;
+          }
+        }
+      }
+
+      if (songsListElement.options.length > 0) {
+        songsListElement.selectedIndex = 0;
+        selectedSongDir = songsListElement.options[0].value;
+      } else {
+        selectedSongDir = "";
+      }
+      onSongSelectionChanged();
+    }
+
+    function findSelectedSong() {
+      if (!selectedSongDir) {
+        return null;
+      }
+      for (const song of cachedSongs) {
+        if (song.song_dir === selectedSongDir) {
+          return song;
+        }
+      }
+      return null;
+    }
+
+    function setDifficultyOptions(song) {
+      difficultySelectElement.innerHTML = "";
+      if (!song || !Array.isArray(song.difficulties) || song.difficulties.length === 0) {
+        return;
+      }
+
+      for (const difficulty of song.difficulties) {
+        const option = document.createElement("option");
+        option.value = difficulty;
+        option.textContent = difficulty;
+        difficultySelectElement.appendChild(option);
+      }
+
+      const preferred = "Difficulty_Easy";
+      let preferredIndex = -1;
+      for (let index = 0; index < difficultySelectElement.options.length; index += 1) {
+        if (difficultySelectElement.options[index].value === preferred) {
+          preferredIndex = index;
+          break;
+        }
+      }
+
+      if (preferredIndex >= 0) {
+        difficultySelectElement.selectedIndex = preferredIndex;
+      } else if (difficultySelectElement.options.length > 0) {
+        difficultySelectElement.selectedIndex = 0;
+      }
+    }
+
+    function updateControls() {
+      const connection = (latestState && latestState.connection) ? latestState.connection : {};
+      const connected = !!connection.connected;
+      const ready = !!connection.ready;
+
+      const selectedSong = findSelectedSong();
+      const hasSelection = !!selectedSong;
+
+      startButtonElement.disabled = !(connected && ready && hasSelection);
+      difficultySelectElement.disabled = !(connected && ready && hasSelection);
+      pauseButtonElement.disabled = !(connected && ready);
+      stopButtonElement.disabled = !(connected && ready);
+
+      const statusResponse = (latestState && latestState.status_response) ? latestState.status_response : {};
+      const statusObject = (statusResponse && statusResponse.status) ? statusResponse.status : {};
+      const paused = !!(statusObject && statusObject.paused);
+
+      pauseButtonElement.textContent = paused ? "Resume" : "Pause";
+    }
+
+    function updateStatusBar() {
+      const connection = (latestState && latestState.connection) ? latestState.connection : {};
+      const connected = !!connection.connected;
+      const ready = !!connection.ready;
+      let screenName = safeString(connection.screen).trim();
+
+      const statusResponse = (latestState && latestState.status_response) ? latestState.status_response : {};
+      const statusObject = (statusResponse && statusResponse.status) ? statusResponse.status : {};
+
+      const playing = !!(statusObject && statusObject.is_playing);
+      const paused = !!(statusObject && statusObject.paused);
+      const currentTitle = safeString(statusObject && statusObject.current_title).trim();
+
+      if (!screenName) {
+        screenName = safeString(statusObject && statusObject.screen).trim();
+      }
+
+      const parts = [];
+      parts.push("ITGmania " + (connected ? "connected" : "disconnected"));
+      parts.push(ready ? "ready" : "not-ready");
+      if (screenName) {
+        parts.push("screen=" + screenName);
+      }
+      parts.push("playing=" + (playing ? "1" : "0"));
+      parts.push("paused=" + (paused ? "1" : "0"));
+      if (currentTitle) {
+        parts.push("title=" + currentTitle);
+      }
+
+      const lastLogLine = safeString(latestState && latestState.last_log_line).trim();
+      if (lastLogLine) {
+        parts.push(lastLogLine);
+      }
+
+      statusBarElement.textContent = parts.join(" | ");
+      connectionInfoElement.textContent = "Harness is listening on ws://127.0.0.1:8765 and serving this page from Flask.";
+    }
+
+    function updateLogs() {
+      const logs = (latestState && Array.isArray(latestState.logs)) ? latestState.logs : [];
+      logBoxElement.textContent = logs.slice(-200).join("\n");
+      logBoxElement.scrollTop = logBoxElement.scrollHeight;
+    }
+
+    function onSongSelectionChanged() {
+      selectedSongDir = songsListElement.value || "";
+      const selectedSong = findSelectedSong();
+      setDifficultyOptions(selectedSong);
+      updateControls();
+    }
+
+    async function refreshState() {
+      try {
+        latestState = await fetchJson("/api/state", { method: "GET" });
+        updateControls();
+        updateStatusBar();
+        updateLogs();
+      } catch (error) {
+        statusBarElement.textContent = "State error: " + safeString(error);
+      }
+    }
+
+    async function refreshSongs() {
+      try {
+        const response = await fetchJson("/api/songs", { method: "GET" });
+        const songs = (response && Array.isArray(response.songs)) ? response.songs : [];
+        cachedSongs = songs;
+        songsLoadedOnce = !!(response && response.songs_loaded_once);
+        renderSongsList(songs);
+      } catch (error) {
+        statusBarElement.textContent = "Song list error: " + safeString(error);
+      }
+    }
+
+    async function refreshSongsUntilLoaded() {
+      await refreshSongs();
+      if (cachedSongs.length > 0) {
+        return;
+      }
+      setTimeout(refreshSongsUntilLoaded, 1000);
+    }
+
+    async function sendStart() {
+      const selectedSong = findSelectedSong();
+      if (!selectedSong) {
+        return;
+      }
+      const difficulty = difficultySelectElement.value || "Difficulty_Easy";
+      await fetchJson("/api/start_song", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ song_dir: selectedSong.song_dir, difficulty: difficulty })
+      });
+    }
+
+    async function sendTogglePause() {
+      const statusResponse = (latestState && latestState.status_response) ? latestState.status_response : {};
+      const statusObject = (statusResponse && statusResponse.status) ? statusResponse.status : {};
+      const paused = !!(statusObject && statusObject.paused);
+
+      await fetchJson("/api/set_paused", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paused: !paused })
+      });
+    }
+
+    async function sendStop() {
+      await fetchJson("/api/stop_song", { method: "POST" });
+    }
+
+    async function sendRefreshSongs() {
+      songsLoadedOnce = false;
+      await fetchJson("/api/refresh_songs", { method: "POST" });
+      await refreshSongsUntilLoaded();
+    }
+
+    function startPolling() {
+      setInterval(refreshState, 250);
+
+      setInterval(() => {
+        if (!songsLoadedOnce) {
+          refreshSongs();
+        }
+      }, 1000);
+    }
+
+    function wireUpEvents() {
+      songsListElement.addEventListener("change", onSongSelectionChanged);
+
+      startButtonElement.addEventListener("click", async () => {
+        try {
+          await sendStart();
+        } catch (error) {
+          statusBarElement.textContent = "Start error: " + safeString(error);
+        }
+      });
+
+      pauseButtonElement.addEventListener("click", async () => {
+        try {
+          await sendTogglePause();
+        } catch (error) {
+          statusBarElement.textContent = "Pause error: " + safeString(error);
+        }
+      });
+
+      stopButtonElement.addEventListener("click", async () => {
+        try {
+          await sendStop();
+        } catch (error) {
+          statusBarElement.textContent = "Stop error: " + safeString(error);
+        }
+      });
+
+      refreshButtonElement.addEventListener("click", async () => {
+        try {
+          await sendRefreshSongs();
+        } catch (error) {
+          statusBarElement.textContent = "Refresh error: " + safeString(error);
+        }
+      });
+    }
+
+    window.addEventListener("load", async () => {
+      wireUpEvents();
+      await refreshState();
+      await refreshSongs();
+      startPolling();
+    });
+  </script>
+</body>
+</html>

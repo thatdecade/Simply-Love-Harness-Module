@@ -1,5 +1,7 @@
+import argparse
 import asyncio
 import logging
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -35,6 +37,29 @@ def _safe_string(value: Any) -> str:
     except Exception:
         return ""
 
+
+
+def _parse_kv_fields(text: str) -> Dict[str, str]:
+    fields: Dict[str, str] = {}
+    for part in text.split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+def _screen_from_heartbeat_value(value: str) -> str:
+    fields = _parse_kv_fields(value)
+    return fields.get("screen", "").strip()
+
+
+def _screen_from_screen_value(value: str) -> str:
+    # RemoteWsHarness can send: SCREEN|<screen>|uptime_seconds=...
+    return value.split("|", 1)[0].strip()
 
 @dataclass(frozen=True)
 class UiSong:
@@ -100,7 +125,8 @@ class ItgmaniQtBridge(QObject):
         self._ready_detected = False
         self._songs_loaded_once = False
 
-        self._songs_refresh_lock = asyncio.Lock()
+        self._songs_refresh_lock: Optional[asyncio.Lock] = None
+
 
         self._runner.submit(self._run())
 
@@ -129,6 +155,8 @@ class ItgmaniQtBridge(QObject):
             self._ready_detected = True
 
     async def _run(self) -> None:
+        self._songs_refresh_lock = asyncio.Lock()
+
         self._server = ItgmaniHarnessServer(
             host=self._host,
             port=self._port,
@@ -139,14 +167,39 @@ class ItgmaniQtBridge(QObject):
         self._client = ItgmaniClient(self._server.session)
 
         async def on_text_event(text_event: ItgmaniTextEvent) -> None:
+            if self._server is None:
+                return
+
             if text_event.kind == "heartbeat":
                 self._mark_ready()
+                screen_name = _screen_from_heartbeat_value(_safe_string(text_event.value))
+                if screen_name:
+                    self._server.session.last_screen = screen_name
+                self.connection_updated.emit(
+                    {
+                        "connected": True,
+                        "ready": self._ready_detected,
+                        "screen": self._server.session.last_screen,
+                    }
+                )
+
             if text_event.kind == "screen":
-                self.connection_updated.emit({"connected": True, "ready": self._ready_detected, "screen": text_event.value})
+                screen_name = _screen_from_screen_value(_safe_string(text_event.value))
+                if screen_name:
+                    self._server.session.last_screen = screen_name
+                self.connection_updated.emit(
+                    {
+                        "connected": True,
+                        "ready": self._ready_detected,
+                        "screen": self._server.session.last_screen,
+                    }
+                )
 
         async def on_disconnect() -> None:
             self._ready_detected = False
             self._songs_loaded_once = False
+            self.songs_updated.emit([])
+            self.status_updated.emit({})
             self.connection_updated.emit({"connected": False, "ready": False, "screen": ""})
 
         self._server.session.set_text_event_handler(on_text_event)
@@ -159,7 +212,16 @@ class ItgmaniQtBridge(QObject):
             self.connection_updated.emit({"connected": False, "ready": False, "screen": ""})
             self._emit_log(f"Listening on ws://{self._host}:{self._port} and waiting for ITGmania to connect")
 
-            await self._server.session.connected_event.wait()
+            while not self._stop_requested.is_set():
+                if self._server.session.is_connected:
+                    break
+                try:
+                    await asyncio.wait_for(self._server.session.connected_event.wait(), timeout=0.25)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+            if self._stop_requested.is_set():
+                break
             self.connection_updated.emit({"connected": True, "ready": False, "screen": self._server.session.last_screen})
             self._emit_log("ITGmania connected")
 
@@ -256,6 +318,8 @@ class ItgmaniQtBridge(QObject):
             return
         if self._server is None or not self._server.session.is_connected:
             return
+        if self._songs_refresh_lock is None:
+            return
 
         async with self._songs_refresh_lock:
             self._emit_log(f"Refreshing songs ({source_label})")
@@ -336,11 +400,11 @@ class ItgmaniQtBridge(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, host: str, port: int) -> None:
         super().__init__()
         self.setWindowTitle("ITGmania Harness Demo")
 
-        self._bridge = ItgmaniQtBridge(host="127.0.0.1", port=8765)
+        self._bridge = ItgmaniQtBridge(host=host, port=port)
         self._bridge.songs_updated.connect(self._on_songs_updated)
         self._bridge.status_updated.connect(self._on_status_updated)
         self._bridge.connection_updated.connect(self._on_connection_updated)
@@ -544,8 +608,13 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
-    app = QApplication([])
-    window = MainWindow()
+    parser = argparse.ArgumentParser(description="ITGmania Harness Demo (PyQt)")
+    parser.add_argument("--host", default="127.0.0.1", help="Harness websocket bind host")
+    parser.add_argument("--port", type=int, default=8765, help="Harness websocket bind port")
+    arguments, qt_args = parser.parse_known_args(sys.argv[1:])
+
+    app = QApplication([sys.argv[0]] + qt_args)
+    window = MainWindow(host=arguments.host, port=arguments.port)
     window.resize(900, 600)
     window.show()
     return app.exec()

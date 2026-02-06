@@ -26,6 +26,30 @@ def safe_string(value: Any) -> str:
         return ""
 
 
+
+def _parse_kv_fields(text: str) -> Dict[str, str]:
+    fields: Dict[str, str] = {}
+    for part in text.split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+def _screen_from_heartbeat_value(value: str) -> str:
+    fields = _parse_kv_fields(value)
+    return fields.get("screen", "").strip()
+
+
+def _screen_from_screen_value(value: str) -> str:
+    # RemoteWsHarness can send: SCREEN|<screen>|uptime_seconds=...
+    return value.split("|", 1)[0].strip()
+
+
 @dataclass(frozen=True)
 class UiSong:
     song_dir: str
@@ -176,13 +200,28 @@ class ItgmaniWebBridge:
         self._client = ItgmaniClient(self._server.session)
 
         async def on_text_event(text_event: ItgmaniTextEvent) -> None:
+            if self._server is None:
+                return
+
             if text_event.kind == "heartbeat":
                 self._mark_ready()
-            if text_event.kind == "screen":
+                screen_name = _screen_from_heartbeat_value(safe_string(text_event.value))
+                if screen_name:
+                    self._server.session.last_screen = screen_name
                 self._set_connection_state(
                     connected=True,
                     ready=self._ready_detected,
-                    screen=safe_string(text_event.value),
+                    screen=safe_string(self._server.session.last_screen),
+                )
+
+            if text_event.kind == "screen":
+                screen_name = _screen_from_screen_value(safe_string(text_event.value))
+                if screen_name:
+                    self._server.session.last_screen = screen_name
+                self._set_connection_state(
+                    connected=True,
+                    ready=self._ready_detected,
+                    screen=safe_string(self._server.session.last_screen),
                 )
 
         async def on_disconnect() -> None:
@@ -206,7 +245,15 @@ class ItgmaniWebBridge:
             self._set_connection_state(connected=False, ready=False, screen="")
             self._emit_log(f"Listening on ws://{self._host}:{self._port} and waiting for ITGmania to connect")
 
-            await self._server.session.connected_event.wait()
+            while not self._stop_requested.is_set():
+                try:
+                    await asyncio.wait_for(self._server.session.connected_event.wait(), timeout=0.25)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+            if self._stop_requested.is_set():
+                break
             self._set_connection_state(
                 connected=True,
                 ready=False,
